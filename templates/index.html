@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Monitor y Visor de EEG</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f4f6f9; display: flex; justify-content: center; align-items: flex-start; min-height: 100vh; margin: 0; color: #333; padding: 20px; box-sizing: border-box; }
+        .container { width: 90%; max-width: 1000px; background-color: white; padding: 30px; border-radius: 12px; box-shadow: 0 6px 12px rgba(0,0,0,0.1); }
+        h1, h2 { text-align: center; margin-top: 0; color: #2c3e50; }
+        .form-container, .viewer-container { display: flex; flex-direction: column; gap: 15px; margin-bottom: 20px; padding: 20px; border: 1px solid #e9ecef; border-radius: 8px; }
+        input, select { padding: 12px; border-radius: 8px; border: 1px solid #ccc; font-size: 16px; width: 100%; box-sizing: border-box; }
+        .button { padding: 12px; border-radius: 8px; border: none; font-size: 16px; cursor: pointer; transition: background-color 0.3s; width: 100%; margin-top: 5px; }
+        .button-primary { background-color: #007bff; color: white; }
+        .button-secondary { background-color: #6c757d; color: white; }
+        .button-danger { background-color: #dc3545; color: white; }
+        .hidden { display: none; }
+        .chart-wrapper { position: relative; height: 50vh; min-height: 350px; margin-top: 20px; }
+        .status-box { text-align: center; margin: 15px 0; padding: 15px; border-radius: 8px; background-color: #e9ecef; border: 1px solid #dee2e6; }
+        .status-box span { font-weight: bold; font-size: 1.2em; color: #495057; }
+        .controls-container { display: flex; gap: 10px; margin-top: 20px; }
+        #dataViewerContainer { margin-top: 30px; }
+        #rawDataOutput {
+            background-color: #2c3e50;
+            color: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 14px;
+            white-space: pre;
+            overflow-x: auto;
+            max-height: 400px;
+            border: 1px solid #dee2e6;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div id="mainContainer">
+            <h1>Panel de Control EEG</h1>
+            <div class="form-container">
+                <h2>Iniciar Nueva Sesión de Monitoreo</h2>
+                <form id="userForm">
+                    <input type="text" id="nombre" placeholder="Nombre" required>
+                    <input type="text" id="apellido" placeholder="Apellido" required>
+                    <input type="text" id="actividad" placeholder="Actividad (ej. 'Reposo')" required>
+                    <button type="submit" class="button button-primary">Iniciar Monitoreo en Tiempo Real</button>
+                </form>
+            </div>
+            <div class="viewer-container">
+                <h2>Ver Sesión Guardada</h2>
+                <select id="sessionSelector"><option>Cargando sesiones...</option></select>
+                <button id="loadSessionButton" class="button button-secondary">Cargar y Visualizar Sesión</button>
+            </div>
+        </div>
+
+        <div id="monitorContainer" class="hidden">
+            <h2 id="monitorTitle"></h2>
+            <div class="status-box">Estado Estimado: <span id="userStatus">Esperando datos...</span></div>
+            <div class="chart-wrapper"><canvas id="eegChart"></canvas></div>
+            <div class="controls-container">
+                <button id="stopButton" class="button button-danger">Detener Monitoreo</button>
+                <button id="backButton" class="button button-secondary">Volver al Inicio</button>
+            </div>
+
+            <div id="dataViewerContainer" class="hidden">
+                <h3>Datos Crudos de la Sesión</h3>
+                <pre id="rawDataOutput"></pre>
+            </div>
+        </div>
+    </div>
+
+<script>
+    const dataViewerContainer = document.getElementById('dataViewerContainer');
+    const rawDataOutput = document.getElementById('rawDataOutput');
+
+    const mainContainer = document.getElementById('mainContainer');
+    const userForm = document.getElementById('userForm');
+    const sessionSelector = document.getElementById('sessionSelector');
+    const loadSessionButton = document.getElementById('loadSessionButton');
+    const monitorContainer = document.getElementById('monitorContainer');
+    const monitorTitle = document.getElementById('monitorTitle');
+    const backButton = document.getElementById('backButton');
+    const stopButton = document.getElementById('stopButton');
+    const userStatus = document.getElementById('userStatus');
+    let dataFetchInterval, eegChart;
+
+    const BANDS = {
+        delta: { from: 1, to: 2, color: 'rgba(100, 100, 100, 0.7)' },
+        theta: { from: 2, to: 4, color: 'rgba(255, 99, 132, 0.7)' },
+        alpha: { from: 4, to: 6, color: 'rgba(54, 162, 235, 0.7)' },
+        beta:  { from: 6, to: 15, color: 'rgba(75, 192, 192, 0.7)' },
+        gamma: { from: 15, to: 25, color: 'rgba(255, 206, 86, 0.7)' }
+    };
+    
+    let smoothedData = new Array(32).fill(0); 
+    const SMOOTHING_FACTOR = 0.4;
+
+    async function loadSessionList() {
+        try {
+            sessionSelector.innerHTML = '<option>Actualizando lista...</option>';
+            const response = await fetch('/api/sessions');
+            const files = await response.json();
+            if (files.length === 0) {
+                sessionSelector.innerHTML = '<option value="">No hay sesiones guardadas</option>';
+                loadSessionButton.disabled = true;
+            } else {
+                sessionSelector.innerHTML = '<option value="">-- Selecciona una sesión --</option>';
+                files.forEach(file => {
+                    const option = document.createElement('option');
+                    option.value = file;
+                    option.textContent = file;
+                    sessionSelector.appendChild(option);
+                });
+                loadSessionButton.disabled = false;
+            }
+        } catch (error) { console.error("Error al cargar sesiones:", error); }
+    }
+
+    document.addEventListener('DOMContentLoaded', loadSessionList);
+    // LA LÍNEA PROBLEMÁTICA HA SIDO ELIMINADA DE AQUÍ
+
+    userForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        smoothedData.fill(0);
+        const formData = { nombre: document.getElementById('nombre').value, apellido: document.getElementById('apellido').value, actividad: document.getElementById('actividad').value };
+        const response = await fetch('/api/start_session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(formData) });
+        if (!response.ok) { alert("No se pudo iniciar la sesión."); return; }
+        
+        monitorTitle.innerText = `Monitoreando a: ${formData.nombre} (Tiempo Real)`;
+        mainContainer.classList.add('hidden');
+        monitorContainer.classList.remove('hidden');
+        stopButton.classList.remove('hidden');
+        stopButton.disabled = false;
+        dataViewerContainer.classList.add('hidden');
+        createRealtimeChart();
+        dataFetchInterval = setInterval(fetchData, 1000);
+    });
+
+    loadSessionButton.addEventListener('click', async () => {
+        const filename = sessionSelector.value;
+        if (!filename) return;
+        const response = await fetch(`/api/session_data/${filename}`);
+        if (!response.ok) { alert("No se pudo cargar la sesión."); return; }
+        const sessionData = await response.json();
+        monitorTitle.innerText = `Viendo Sesión: ${filename}`;
+        userStatus.innerText = "Análisis Histórico";
+        mainContainer.classList.add('hidden');
+        monitorContainer.classList.remove('hidden');
+        stopButton.classList.add('hidden');
+
+        displaySessionChart(sessionData);
+        displaySessionData(sessionData);
+    });
+
+    backButton.addEventListener('click', () => {
+        clearInterval(dataFetchInterval);
+        mainContainer.classList.remove('hidden');
+        monitorContainer.classList.add('hidden');
+        userStatus.innerText = "Esperando datos...";
+        
+        dataViewerContainer.classList.add('hidden');
+        rawDataOutput.textContent = '';
+
+        if (eegChart) {
+            eegChart.destroy();
+        }
+        loadSessionList();
+    });
+    
+    stopButton.addEventListener('click', () => {
+        clearInterval(dataFetchInterval);
+        userStatus.innerText = "Monitoreo Detenido";
+        stopButton.disabled = true;
+    });
+
+    function createRealtimeChart() {
+        if (eegChart) eegChart.destroy();
+        const ctx = document.getElementById('eegChart').getContext('2d');
+        eegChart = new Chart(ctx, {
+            type: 'bar',
+            data: { labels: Array.from({length: 32}, (_, i) => `${i * 2}`), datasets: [{ label: 'Amplitud de Frecuencia (Suavizada)', data: [], backgroundColor: 'rgba(54, 162, 235, 0.6)' }] },
+            options: { responsive: true, maintainAspectRatio: false, animation: { duration: 0 }, scales: { y: { beginAtZero: true, max: 100 } } }
+        });
+    }
+
+    async function fetchData() {
+        try {
+            const rawData = await (await fetch('/api/data')).json();
+            if (rawData && rawData.length > 0 && eegChart) {
+                for (let i = 0; i < 32; i++) {
+                    smoothedData[i] = (rawData[i] * SMOOTHING_FACTOR) + (smoothedData[i] * (1 - SMOOTHING_FACTOR));
+                }
+                eegChart.data.datasets[0].data = smoothedData;
+                eegChart.update();
+                updateUserStatusFromRealtimeData(smoothedData);
+            }
+        } catch (error) {
+            console.error("Error al obtener datos:", error);
+            clearInterval(dataFetchInterval);
+            userStatus.innerText = "Error de conexión";
+        }
+    }
+
+    function updateUserStatusFromRealtimeData(allBins) {
+        let dominantBand = 'desconocido';
+        let maxAverage = -1;
+        for (const bandName in BANDS) {
+            const band = BANDS[bandName];
+            const relevantBins = allBins.slice(band.from, band.to + 1);
+            const sum = relevantBins.reduce((a, b) => a + b, 0);
+            const average = relevantBins.length > 0 ? sum / relevantBins.length : 0;
+            if (average > maxAverage) {
+                maxAverage = average;
+                dominantBand = bandName;
+            }
+        }
+        const stateMap = {
+            delta: 'Sueño Profundo', theta: 'Somnolencia / Meditación',
+            alpha: 'Relajado / Calmo', beta: 'Concentrado / Activo',
+            gamma: 'Procesamiento Intenso', desconocido: 'Analizando...'
+        };
+        userStatus.innerText = stateMap[dominantBand] || 'Analizando...';
+    }
+    
+    function displaySessionChart(sessionData) {
+        if (eegChart) eegChart.destroy();
+        const timestamps = sessionData.data.map(row => row[0].split(' ')[1]);
+        const overallAverageData = sessionData.data.map(row => {
+            let sumOfAverages = 0;
+            let numberOfBands = 0;
+            for (const bandName in BANDS) {
+                const band = BANDS[bandName];
+                const relevantBins = row.slice(1 + band.from, 1 + band.to + 1);
+                const sum = relevantBins.reduce((a, b) => a + b, 0);
+                const average = relevantBins.length > 0 ? sum / relevantBins.length : 0;
+                sumOfAverages += average;
+                numberOfBands++;
+            }
+            return numberOfBands > 0 ? sumOfAverages / numberOfBands : 0;
+        });
+        const ctx = document.getElementById('eegChart').getContext('2d');
+        eegChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: timestamps,
+                datasets: [{
+                    label: 'Promedio General de Bandas',
+                    data: overallAverageData,
+                    borderColor: 'rgb(0, 86, 179)',
+                    borderWidth: 2,
+                    fill: false,
+                    tension: 0,
+                    pointRadius: 2,
+                    pointBackgroundColor: 'rgb(0, 86, 179)'
+                }]
+            },
+            options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true, title: { display: true, text: 'Amplitud Promedio General' } }, x: { title: { display: true, text: 'Tiempo de la Sesión' } } }, plugins: { title: { display: true, text: 'Actividad Cerebral General a lo Largo del Tiempo', font: { size: 16 } } } }
+        });
+    }
+
+    function displaySessionData(sessionData) {
+        const headers = sessionData.columns;
+        const rows = sessionData.data;
+        const headerString = headers.join('\t');
+        const rowStrings = rows.map(row => row.join('\t'));
+        const fullText = [headerString, ...rowStrings].join('\n');
+        rawDataOutput.textContent = fullText;
+        dataViewerContainer.classList.remove('hidden');
+    }
+</script>
+</body>
+</html>
